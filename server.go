@@ -62,7 +62,7 @@ func (h *Hub) register(id string, c *Connection) {
 	}
 	h.peers[id] = c
 	h.mu.Unlock()
-
+	c.id = id
 	c.OnClose(func() {
 		h.mu.Lock()
 		if current, ok := h.peers[id]; ok && current == c {

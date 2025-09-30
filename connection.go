@@ -35,6 +35,7 @@ type Connection struct {
 	closeOnce sync.Once
 
 	onClose []func()
+	id      string
 }
 
 func NewConnection(ws *websocket.Conn) *Connection {
@@ -53,6 +54,10 @@ func NewConnection(ws *websocket.Conn) *Connection {
 
 func (c *Connection) Context() context.Context {
 	return c.ctx
+}
+
+func (c *Connection) ID() string {
+	return c.id
 }
 
 func (c *Connection) SetCodec(codec Codec) {
