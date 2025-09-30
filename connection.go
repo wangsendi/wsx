@@ -31,11 +31,17 @@ type Connection struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	closed    chan struct{}
-	closeOnce sync.Once
+	closed      chan struct{}
+	closeOnce   sync.Once
+	connectOnce sync.Once
 
-	onClose []func()
-	id      string
+	onClose           []func()
+	onConnect         []func(*Connection)
+	onError           []func(error)
+	onMessageFallback []func(context.Context, Envelope)
+	onSend            []func(context.Context, Envelope)
+
+	id string
 }
 
 func NewConnection(ws *websocket.Conn) *Connection {
@@ -70,6 +76,7 @@ func (c *Connection) SetCodec(codec Codec) {
 func (c *Connection) Start(ctx context.Context) {
 	go c.writeLoop()
 	go c.readLoop(ctx)
+	c.fireOnConnect()
 }
 
 func (c *Connection) RegisterHandler(msgType string, h MessageHandler) {
@@ -84,7 +91,9 @@ func (c *Connection) RegisterHandler(msgType string, h MessageHandler) {
 func (c *Connection) SendBytes(b []byte) error {
 	select {
 	case <-c.closed:
-		return ErrClosed
+		err := ErrClosed
+		c.fireOnError(err)
+		return err
 	case c.sendCh <- append([]byte(nil), b...):
 		return nil
 	}
@@ -93,9 +102,14 @@ func (c *Connection) SendBytes(b []byte) error {
 func (c *Connection) SendEnvelope(env Envelope) error {
 	frame, err := c.codec.Encode(env)
 	if err != nil {
+		c.fireOnError(err)
 		return err
 	}
-	return c.SendBytes(frame)
+	if err := c.SendBytes(frame); err != nil {
+		return err
+	}
+	c.fireOnSend(c.ctx, env)
+	return nil
 }
 
 func (c *Connection) Close() {
@@ -119,6 +133,42 @@ func (c *Connection) OnClose(fn func()) {
 	c.mu.Unlock()
 }
 
+func (c *Connection) OnConnect(fn func(*Connection)) {
+	if fn == nil {
+		return
+	}
+	c.mu.Lock()
+	c.onConnect = append(c.onConnect, fn)
+	c.mu.Unlock()
+}
+
+func (c *Connection) OnError(fn func(error)) {
+	if fn == nil {
+		return
+	}
+	c.mu.Lock()
+	c.onError = append(c.onError, fn)
+	c.mu.Unlock()
+}
+
+func (c *Connection) OnMessageFallback(fn func(context.Context, Envelope)) {
+	if fn == nil {
+		return
+	}
+	c.mu.Lock()
+	c.onMessageFallback = append(c.onMessageFallback, fn)
+	c.mu.Unlock()
+}
+
+func (c *Connection) OnSend(fn func(context.Context, Envelope)) {
+	if fn == nil {
+		return
+	}
+	c.mu.Lock()
+	c.onSend = append(c.onSend, fn)
+	c.mu.Unlock()
+}
+
 func (c *Connection) fireOnClose() {
 	c.mu.Lock()
 	callbacks := c.onClose
@@ -126,6 +176,48 @@ func (c *Connection) fireOnClose() {
 	c.mu.Unlock()
 	for _, fn := range callbacks {
 		fn()
+	}
+}
+
+func (c *Connection) fireOnConnect() {
+	c.connectOnce.Do(func() {
+		c.mu.Lock()
+		callbacks := c.onConnect
+		c.onConnect = nil
+		c.mu.Unlock()
+		for _, fn := range callbacks {
+			fn(c)
+		}
+	})
+}
+
+func (c *Connection) fireOnError(err error) {
+	if err == nil {
+		return
+	}
+	c.mu.RLock()
+	callbacks := append([]func(error){}, c.onError...)
+	c.mu.RUnlock()
+	for _, fn := range callbacks {
+		fn(err)
+	}
+}
+
+func (c *Connection) fireOnMessageFallback(ctx context.Context, env Envelope) {
+	c.mu.RLock()
+	callbacks := append([]func(context.Context, Envelope){}, c.onMessageFallback...)
+	c.mu.RUnlock()
+	for _, fn := range callbacks {
+		fn(ctx, env)
+	}
+}
+
+func (c *Connection) fireOnSend(ctx context.Context, env Envelope) {
+	c.mu.RLock()
+	callbacks := append([]func(context.Context, Envelope){}, c.onSend...)
+	c.mu.RUnlock()
+	for _, fn := range callbacks {
+		fn(ctx, env)
 	}
 }
 
@@ -143,6 +235,7 @@ func (c *Connection) readLoop(ctx context.Context) {
 
 		typeCode, frame, err := c.ws.ReadMessage()
 		if err != nil {
+			c.fireOnError(err)
 			return
 		}
 		if typeCode != websocket.TextMessage && typeCode != websocket.BinaryMessage {
@@ -151,10 +244,12 @@ func (c *Connection) readLoop(ctx context.Context) {
 
 		env, err := c.codec.Decode(frame)
 		if err != nil {
+			c.fireOnError(err)
 			continue
 		}
 		h := c.getHandler(env.Type)
 		if h == nil {
+			c.fireOnMessageFallback(c.ctx, env)
 			continue
 		}
 		h(c.ctx, env)
@@ -174,6 +269,7 @@ func (c *Connection) writeLoop() {
 			}
 			c.ws.SetWriteDeadline(time.Now().Add(defaultWriteWait))
 			if err := c.ws.WriteMessage(websocket.TextMessage, frame); err != nil {
+				c.fireOnError(err)
 				return
 			}
 		}
